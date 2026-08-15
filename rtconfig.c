@@ -535,6 +535,12 @@ static void parse_module_configs(cJSON *root) {
     cfg_alt(m, "brightness");
     cfg_str(m, "device", g_cfg.brightness_dev,
             sizeof(g_cfg.brightness_dev));
+    cfg_str(m, "provider", g_cfg.brightness_provider,
+            sizeof(g_cfg.brightness_provider));
+    cfg_str(m, "exec", g_cfg.brightness_exec,
+            sizeof(g_cfg.brightness_exec));
+    g_cfg.brightness_interval =
+        cfg_int(m, "interval", g_cfg.brightness_interval);
     set_action("brightness",
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click")),
                cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(m, "on-click-middle")),
@@ -687,6 +693,9 @@ void mango_config_defaults(void) {
   g_cfg.tray_gap = 4;
   snprintf(g_cfg.brightness_dev, sizeof(g_cfg.brightness_dev), "%s",
            "");
+  snprintf(g_cfg.brightness_provider, sizeof(g_cfg.brightness_provider), "%s",
+           "sysfs");
+  g_cfg.brightness_interval = 0;
   snprintf(g_cfg.brightness_fmt, sizeof(g_cfg.brightness_fmt), "%s",
            "☀{}%");
   snprintf(g_cfg.volume_ctrl, sizeof(g_cfg.volume_ctrl), "%s",

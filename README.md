@@ -163,8 +163,22 @@ CSS priority is `$MANGOBAR_CSS` > `~/.config/mangobar/style.css`.
   empty — and `tag-names`, an array of custom labels, index 0 = tag 1)
 - `cpu`: `{usage}` is the CPU usage percent and `{load}` is the 1-minute
   load average (two decimals); `mem` reads `/proc`
-- `brightness`: read `/sys/class/backlight` (auto-detected or the JSONC
-  `device` field); updates immediately on external changes via udev
+- `brightness`: by default reads `/sys/class/backlight` (auto-detected or
+  the JSONC `device` field) and updates immediately on external changes via
+  udev. Set `"provider": "command"` and `exec` to use a command that prints
+  an integer percentage instead. `interval` is an optional fallback polling
+  period in seconds; when omitted or `0`, the command runs at startup and
+  after a completed brightness scroll action only.
+
+  ```jsonc
+  "backlight": {
+    "provider": "command",
+    "exec": "zigdc ctl get brightness",
+    "interval": 15,
+    "on-scroll-up": "zigdc ctl set brightness +5",
+    "on-scroll-down": "zigdc ctl set brightness -5"
+  }
+  ```
 - `volume`: read via the PulseAudio library, with ALSA fallback; shows mute
   state and updates immediately on external changes via PulseAudio events
 - `clock`: time (`#clock`) and date (`#clock.date`) with separate CSS;

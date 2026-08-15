@@ -479,7 +479,11 @@ static struct udev *g_udev;
 static struct udev_monitor *g_udev_mon;
 static int g_udev_fd = -1;
 static bool brightness_dirty;
+// Completion notifications for command-provider brightness actions.
+static int brightness_notify_read_fd = -1;
+static int brightness_notify_write_fd = -1;
 
+static bool brightness_provider_is_command(void);
 static const struct wl_pointer_listener pointer_listener;
 
 static MangobarTray *tray;
@@ -1862,7 +1866,7 @@ static void ipc_send_command(const char *fmt, ...) {
   close(fd);
 }
 
-static void run_command(const char *cmd) {
+static void run_command(const char *cmd, int notify_fd) {
   if (!cmd || !*cmd)
     return;
   pid_t pid = fork();
@@ -1889,11 +1893,26 @@ static void run_command(const char *cmd) {
     }
     // Don't leak mangobar's sockets/pipes into GUI children.
 #ifdef SYS_close_range
-    syscall(SYS_close_range, 3, ~0U, 0);
+    if (notify_fd >= 3) {
+      if (notify_fd > 3)
+        syscall(SYS_close_range, 3, (unsigned int)notify_fd - 1, 0);
+      syscall(SYS_close_range, (unsigned int)notify_fd + 1, ~0U, 0);
+    } else {
+      syscall(SYS_close_range, 3, ~0U, 0);
+    }
 #else
     for (int fd = 3; fd < 1024; fd++)
-      close(fd);
+      if (fd != notify_fd)
+        close(fd);
 #endif
+    if (notify_fd >= 3) {
+      // Run in a subshell so even an `exec` in the action cannot suppress the
+      // completion notification sent by the outer shell.
+      char wrapped[768];
+      snprintf(wrapped, sizeof(wrapped), "( %s ); printf . >&%d", cmd,
+               notify_fd);
+      execl("/bin/sh", "sh", "-c", wrapped, (char *)NULL);
+    }
     execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
     _exit(127);
   }
@@ -1998,11 +2017,26 @@ static void handle_module_action(Bar *bar, const char *module, int tag,
   }
   if (strncmp(cmd, "@ipc:", 5) == 0) {
     ipc_send_command("%s\n", cmd + 5);
+    if (strcmp(module, "brightness") == 0)
+      brightness_dirty = true;
     return;
   }
-  run_command(cmd);
-  // Refresh immediately after brightness/volume changes
-  if (strcmp(module, "brightness") == 0 || strcmp(module, "volume") == 0)
+  bool brightness_action = strcmp(module, "brightness") == 0;
+  bool brightness_scroll = strcmp(module, "brightness") == 0 &&
+                           (button == 4 || button == 5);
+  bool wait_for_brightness_action = brightness_scroll &&
+                                    brightness_provider_is_command() &&
+                                    brightness_notify_write_fd >= 0;
+  run_command(cmd, wait_for_brightness_action ? brightness_notify_write_fd
+                                               : -1);
+  // Keep sysfs behavior responsive for every brightness action. Command
+  // provider scroll actions wait for the command's completion notification,
+  // avoiding a read that races the setter.
+  if (brightness_action && !wait_for_brightness_action)
+    brightness_dirty = true;
+  // Volume changes do not have a completion notification; its event source
+  // will update it as well.
+  if (strcmp(module, "volume") == 0)
     sys_refresh = true;
 }
 
@@ -3063,7 +3097,50 @@ static const struct wl_pointer_listener pointer_listener = {
 static int cpu_prev_total, cpu_prev_idle;
 static uint64_t last_cpu_ms;
 
-static void update_brightness() {
+static bool brightness_provider_is_command(void) {
+  return strcmp(g_cfg.brightness_provider, "command") == 0;
+}
+
+static void update_brightness(bool force) {
+  static uint64_t last_command_ms;
+  if (brightness_provider_is_command()) {
+    if (!g_cfg.brightness_exec[0])
+      return;
+
+    uint64_t now = now_ms();
+    uint64_t interval_ms =
+        g_cfg.brightness_interval > 0
+            ? (uint64_t)g_cfg.brightness_interval * 1000u
+            : 0;
+    // Without an interval, command output is read once at startup and after
+    // an explicitly requested refresh (such as a completed scroll action).
+    if (!force && last_command_ms &&
+        (!interval_ms || now - last_command_ms < interval_ms))
+      return;
+
+    FILE *fp = popen(g_cfg.brightness_exec, "r");
+    last_command_ms = now;
+    if (!fp)
+      return;
+    char output[64];
+    bool got_value = fgets(output, sizeof(output), fp) != NULL;
+    pclose(fp);
+    if (!got_value)
+      return;
+    char *end;
+    errno = 0;
+    long pct = strtol(output, &end, 10);
+    if (end == output || errno == ERANGE)
+      return;
+    if (pct < 0)
+      pct = 0;
+    else if (pct > 100)
+      pct = 100;
+    Bar *bar;
+    wl_list_for_each(bar, &bar_list, link) bar->brightness_pct = (int)pct;
+    return;
+  }
+
   static char dev[64];
   static bool dev_init = false;
   if (!dev_init) {
@@ -3117,6 +3194,8 @@ static void update_brightness() {
 
 // Create the udev backlight monitor (called once).
 static void udev_init(void) {
+  if (brightness_provider_is_command())
+    return;
   if (g_udev)
     return;
   g_udev = udev_new();
@@ -3136,6 +3215,8 @@ static void udev_init(void) {
 
 // Handle a backlight uevent; mark the module dirty for redraw.
 static void udev_dispatch(void) {
+  if (brightness_provider_is_command())
+    return;
   if (!g_udev_mon)
     return;
   struct udev_device *dev = udev_monitor_receive_device(g_udev_mon);
@@ -3573,7 +3654,7 @@ static void update_system_info() {
     Bar *b;
     wl_list_for_each(b, &bar_list, link) b->mem_pct = pct;
   }
-  update_brightness();
+  update_brightness(false);
   update_volume();
   update_battery();
   update_network();
@@ -3630,8 +3711,9 @@ static void event_loop() {
   int wl_fd = wl_display_get_fd(display);
   while (running) {
     int tray_fd = tray ? tray_get_fd(tray) : -1;
-    struct pollfd fds[5];
-    int nfds = 0, ipc_idx = -1, tray_idx = -1, pa_idx = -1, udev_idx = -1;
+    struct pollfd fds[6];
+    int nfds = 0, ipc_idx = -1, tray_idx = -1, pa_idx = -1, udev_idx = -1,
+        brightness_notify_idx = -1;
     fds[nfds++] =
         (struct pollfd){.fd = wl_fd, .events = POLLIN | POLLERR | POLLHUP};
     if (ipc_fd >= 0) {
@@ -3651,6 +3733,11 @@ static void event_loop() {
     if (g_udev_fd >= 0) {
       udev_idx = nfds;
       fds[nfds++] = (struct pollfd){.fd = g_udev_fd, .events = POLLIN};
+    }
+    if (brightness_notify_read_fd >= 0) {
+      brightness_notify_idx = nfds;
+      fds[nfds++] =
+          (struct pollfd){.fd = brightness_notify_read_fd, .events = POLLIN};
     }
     // Short timeout while refreshing or the menu is open.
     int timeout = 1000;
@@ -3725,6 +3812,14 @@ static void event_loop() {
     }
     if (udev_idx >= 0 && (fds[udev_idx].revents & POLLIN))
       udev_dispatch();
+    if (brightness_notify_idx >= 0 &&
+        (fds[brightness_notify_idx].revents & POLLIN)) {
+      char notifications[64];
+      while (read(brightness_notify_read_fd, notifications,
+                  sizeof(notifications)) > 0)
+        ;
+      brightness_dirty = true;
+    }
     if (sys_refresh) {
       sys_refresh = false;
       update_system_info();
@@ -3738,7 +3833,7 @@ static void event_loop() {
     }
     if (brightness_dirty) {
       brightness_dirty = false;
-      update_brightness();
+      update_brightness(true);
       Bar *b;
       wl_list_for_each(b, &bar_list, link) b->redraw = true;
     }
@@ -3957,6 +4052,16 @@ int main() {
     fprintf(stderr, "Using built-in default config\n");
   }
 
+  if (brightness_provider_is_command()) {
+    int notify_pipe[2];
+    if (pipe2(notify_pipe, O_NONBLOCK) == 0) {
+      brightness_notify_read_fd = notify_pipe[0];
+      brightness_notify_write_fd = notify_pipe[1];
+    } else {
+      perror("brightness action notification pipe");
+    }
+  }
+
   // Load CSS style sheet
   style_sheet_init(&g_style_sheet);
   char css_buf[512];
@@ -4049,6 +4154,10 @@ int main() {
     pa_mainloop_free(pa_ml);
   if (pulse_event_fd >= 0)
     close(pulse_event_fd);
+  if (brightness_notify_read_fd >= 0)
+    close(brightness_notify_read_fd);
+  if (brightness_notify_write_fd >= 0)
+    close(brightness_notify_write_fd);
   if (g_udev_mon)
     udev_monitor_unref(g_udev_mon);
   if (g_udev)
